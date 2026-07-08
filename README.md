@@ -197,7 +197,7 @@ moment it's fetched — not batched. This means:
 
 ---
 
-## Stage 4 — `translate_opinions.py`
+## Stage 5 — `translate_opinions.py`
 
 Translates the scraped decision texts to English.
 
