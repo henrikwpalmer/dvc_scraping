@@ -6,12 +6,21 @@ sudrf.ru judicial-decision (opinion text) scraper
 Reads the deduplicated combined case workbook (ENGLISH_deduped.xlsx),
 filters to rows where "judicial_acts_link" is present, fetches each
 decision page, extracts the full text of the ruling, and writes
-everything back out to court_cases_and_opinions.xlsx with two new columns:
+everything back out to court_cases_and_opinions.xlsx with four new columns:
   - opinion_text: the decision text inline (truncated with a marker if
     over Excel's 32,767-char cell limit)
   - opinion_text_file: path to a .txt file containing the FULL text,
     saved for every fetched decision (named by case number + short hash)
     in opinion_fulltexts/.
+  - opinion_html_sha256: SHA-256 of the raw decision-page HTML, computed
+    at the moment it was fetched (before any decoding/parsing).
+  - opinion_html_archive_path: where that raw HTML was saved, under
+    original_htmls/<court-domain>/ -- see evidence_archive.py. Every
+    fetched decision page is archived+hashed this way regardless of
+    whether opinion text could be extracted from it, so a "no text
+    found" row can still be checked against the original page later.
+    Chain-of-custody support per the Berkeley Protocol on Digital Open
+    Source Investigations.
 
 ------------------------------------------------------------------------
 CHECKPOINTING / RESUME (safe to interrupt at any time)
@@ -57,22 +66,30 @@ POLITENESS (same approach as sudrf_scraper.py)
 import csv
 import hashlib
 import json
+import os
 import random
 import re
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
+# evidence_archive.py must live alongside this script -- this makes the
+# import work regardless of the current working directory the script is
+# launched from (this script uses "../temp"/"../output" relative paths,
+# implying it's often run from a subfolder).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from evidence_archive import archive_bytes, city_from_url
+
 # =========================================================================
 # CONFIG
 # =========================================================================
 
-INPUT_XLSX = "../temp/ENGLISH_deduped.xlsx"
+INPUT_XLSX = "../output/ENGLISH_deduped.xlsx"
 OUTPUT_XLSX = "../output/court_cases_and_opinions.xlsx"
 LINK_COLUMN = "judicial_acts_link"
 OPINION_COLUMN = "opinion_text"
@@ -80,7 +97,7 @@ OPINION_FILE_COLUMN = "opinion_text_file"
 
 CHECKPOINT_DIR = Path("opinion_checkpoints")
 
-TEST_MODE_DEFAULT = True     # True -> only the first TEST_LINKS links
+TEST_MODE_DEFAULT = False     # True -> only the first TEST_LINKS links
 TEST_LINKS = 10
 
 # EVERY fetched opinion is also saved as its own .txt file (full,
@@ -149,15 +166,27 @@ def decode_response(resp: requests.Response) -> str:
         return resp.content.decode(DEFAULT_ENCODING, errors="replace")
 
 
-def fetch(session: requests.Session, url: str, referer: Optional[str]) -> Optional[str]:
+def fetch(session: requests.Session, url: str, referer: Optional[str],
+          identifier: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Returns (decoded_html_text, sha256_hex, local_archive_path); (None, None,
+    None) on failure. Raw response bytes are archived to
+    original_htmls/<host>/ and SHA-256 hashed before decoding, so the hash
+    covers exactly what the server sent -- see evidence_archive.py.
+    """
     headers = {}
     if referer:
         headers["Referer"] = referer
+    city = city_from_url(url)
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             resp = session.get(url, headers=headers, timeout=30)
             if resp.status_code == 200:
-                return decode_response(resp)
+                sha256_hex, local_path = archive_bytes(
+                    resp.content, city=city, identifier=identifier, source_url=url,
+                    ext=".html", content_type="text/html",
+                )
+                return decode_response(resp), sha256_hex, local_path
             elif resp.status_code in (403, 429):
                 wait = (2 ** attempt) + random.uniform(1, 4)
                 print(f"    [!] HTTP {resp.status_code}. Backing off {wait:.1f}s "
@@ -165,13 +194,13 @@ def fetch(session: requests.Session, url: str, referer: Optional[str]) -> Option
                 time.sleep(wait)
             else:
                 print(f"    [!] HTTP {resp.status_code} for {url}")
-                return None
+                return None, None, None
         except requests.RequestException as e:
             wait = (2 ** attempt) + random.uniform(1, 4)
             print(f"    [!] Request error: {e}. Retrying in {wait:.1f}s "
                   f"(attempt {attempt}/{MAX_RETRIES})...")
             time.sleep(wait)
-    return None
+    return None, None, None
 
 
 def polite_sleep(request_count: int):
@@ -198,9 +227,9 @@ def warm_up_domain(session: requests.Session, url: str,
         return referer
     root = f"{parsed.scheme}://{domain}/"
     print(f"    [i] Warming up new domain: {domain}")
-    fetch(session, root, referer=None)
+    fetch(session, root, referer=None, identifier="root")
     time.sleep(random.uniform(2.0, 4.0))
-    fetch(session, referer, referer=root)
+    fetch(session, referer, referer=root, identifier="search_form")
     time.sleep(random.uniform(2.0, 4.0))
     warmed.add(domain)
     return referer
@@ -266,13 +295,16 @@ def load_checkpoint(url: str) -> Optional[dict]:
     return None
 
 
-def save_checkpoint(url: str, opinion_text: Optional[str], error: Optional[str]):
+def save_checkpoint(url: str, opinion_text: Optional[str], error: Optional[str],
+                     html_sha256: Optional[str] = None, html_archive_path: Optional[str] = None):
     CHECKPOINT_DIR.mkdir(exist_ok=True)
     data = {
         "url": url,
         "opinion_text": opinion_text,
         "error": error,
         "fetched_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "html_sha256": html_sha256,
+        "html_archive_path": html_archive_path,
     }
     checkpoint_path(url).write_text(
         json.dumps(data, ensure_ascii=False), encoding="utf-8"
@@ -315,23 +347,27 @@ def scrape(links: list, retry_failures: bool):
         print(f"[{i}/{len(links)}] Fetching decision: {url}")
         referer = warm_up_domain(session, url, warmed_domains)
         request_count += 1
-        html = fetch(session, url, referer)
+        html, html_sha256, html_archive_path = fetch(session, url, referer, identifier=f"decision_{i}")
 
         if html is None:
             save_checkpoint(url, None, error="fetch_failed")
             failed += 1
         elif looks_like_error_page(html):
-            save_checkpoint(url, None, error="bounced_to_search_form")
+            save_checkpoint(url, None, error="bounced_to_search_form",
+                             html_sha256=html_sha256, html_archive_path=html_archive_path)
             print("    [!] Bounced to search form -- checkpointed as error.")
             failed += 1
         else:
+            print(f"    [archived] {html_archive_path} (sha256: {html_sha256[:12]}...)")
             text = extract_opinion_text(html)
             if text:
-                save_checkpoint(url, text, error=None)
+                save_checkpoint(url, text, error=None,
+                                 html_sha256=html_sha256, html_archive_path=html_archive_path)
                 print(f"    [+] Extracted {len(text)} chars of opinion text.")
                 fetched += 1
             else:
-                save_checkpoint(url, None, error="no_text_found")
+                save_checkpoint(url, None, error="no_text_found",
+                                 html_sha256=html_sha256, html_archive_path=html_archive_path)
                 print("    [!] Page fetched but no opinion text found -- "
                       "checkpointed as error. (The decision may not be "
                       "published yet, or the page layout differs.)")
@@ -366,6 +402,7 @@ def assemble(df_all, df_links):
     import pandas as pd
 
     opinions = {}
+    html_hashes = {}  # url -> (sha256, archive_path)
     n_errors = 0
     if CHECKPOINT_DIR.exists():
         for p in CHECKPOINT_DIR.glob("*.json"):
@@ -377,6 +414,8 @@ def assemble(df_all, df_links):
                 opinions[data["url"]] = data["opinion_text"]
             elif data.get("error"):
                 n_errors += 1
+            if data.get("html_sha256"):
+                html_hashes[data["url"]] = (data["html_sha256"], data.get("html_archive_path", ""))
 
     df_out = df_all.copy()
 
@@ -387,11 +426,15 @@ def assemble(df_all, df_links):
     def process_row(row):
         link = row.get(LINK_COLUMN)
         if not isinstance(link, str) or not link.strip():
-            return pd.Series({OPINION_COLUMN: "", OPINION_FILE_COLUMN: ""})
+            return pd.Series({OPINION_COLUMN: "", OPINION_FILE_COLUMN: "",
+                               "opinion_html_sha256": "", "opinion_html_archive_path": ""})
         link = link.strip()
+        sha256_hex, archive_path = html_hashes.get(link, ("", ""))
         text = opinions.get(link, "")
         if not text:
-            return pd.Series({OPINION_COLUMN: "", OPINION_FILE_COLUMN: ""})
+            return pd.Series({OPINION_COLUMN: "", OPINION_FILE_COLUMN: "",
+                               "opinion_html_sha256": sha256_hex,
+                               "opinion_html_archive_path": archive_path})
 
         if link not in link_to_txt_path:
             LONG_TEXT_DIR.mkdir(exist_ok=True)
@@ -408,9 +451,12 @@ def assemble(df_all, df_links):
         else:
             cell_text = text
         return pd.Series({OPINION_COLUMN: cell_text,
-                          OPINION_FILE_COLUMN: txt_path_str})
+                          OPINION_FILE_COLUMN: txt_path_str,
+                          "opinion_html_sha256": sha256_hex,
+                          "opinion_html_archive_path": archive_path})
 
-    df_out[[OPINION_COLUMN, OPINION_FILE_COLUMN]] = df_out.apply(
+    df_out[[OPINION_COLUMN, OPINION_FILE_COLUMN,
+            "opinion_html_sha256", "opinion_html_archive_path"]] = df_out.apply(
         process_row, axis=1
     )
     df_out.to_excel(OUTPUT_XLSX, index=False)

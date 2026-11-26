@@ -70,6 +70,12 @@ BEING A GOOD NETWORK CITIZEN
   hammering.
 - Respects robots.txt (checked once at startup; the script will warn, not
   silently ignore, if disallowed).
+- Every fetched page's raw response is archived verbatim to
+  original_htmls/<court-domain>/ and SHA-256 hashed at the moment of
+  capture (see evidence_archive.py), with the acquisition context (URL +
+  UTC timestamp + local path) logged to that folder's manifest.csv --
+  chain-of-custody support per the Berkeley Protocol on Digital Open
+  Source Investigations.
 
 This is deliberately conservative. If you're running this across dozens of
 sites, please also consider spacing out *which* site you hit and when
@@ -79,6 +85,7 @@ still use judgment.
 """
 
 import csv
+import os
 import random
 import re
 import sys
@@ -91,6 +98,13 @@ from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 import requests
 from bs4 import BeautifulSoup
 
+# evidence_archive.py must live alongside this script -- this makes the
+# import work regardless of the current working directory the script is
+# launched from (this script itself uses "../input"/"../output" relative
+# paths, implying it's often run from a subfolder).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from evidence_archive import archive_bytes, city_from_url
+
 # =========================================================================
 # CONFIG -- edit these per court site
 # =========================================================================
@@ -100,21 +114,21 @@ from bs4 import BeautifulSoup
 # after running a search, same as BASE_URL used to be). See
 # load_court_list() below for the exact expected column names, or just run
 # make_template() to generate a starter file.
-INPUT_XLSX = "../input/court_URLs_kherson.xlsx"
+INPUT_XLSX = "../input/court_URLs_Luhansk.xlsx"
 
 RESULTS_PER_PAGE = 25          # used to compute total pages from result count
 DEBUG = False                   # True -> only crawl DEBUG_PAGES pages PER COURT
 DEBUG_PAGES = 2
-MANUAL_PAGE_COUNT_FALLBACK = 10  # used only if auto-detection of total results fails
+MANUAL_PAGE_COUNT_FALLBACK = 4  # used only if auto-detection of total results fails
 
 OUTPUT_PREFIX = "../output/cases_output"   # final files will be {OUTPUT_PREFIX}_{CourtName}.csv/.xlsx
-COMBINED_OUTPUT_XLSX = "../output/cases_output_ALL_COURTS_kherson.xlsx"  # combined workbook across all courts
+COMBINED_OUTPUT_XLSX = "../output/cases_output_ALL_COURTS_luhansk5.xlsx"  # combined workbook across all courts
 
 # Extra pause between finishing one court and starting the next (on top of
 # the normal per-request delays within a court). Different courts are
 # different domains/servers, but spacing out *when* you hit each one is
 # still good practice when running this across dozens of sites back to back.
-BETWEEN_COURT_MIN, BETWEEN_COURT_MAX = 15.0, 30.0
+BETWEEN_COURT_MIN, BETWEEN_COURT_MAX = 10.0, 15.0
 
 # If True, the auto-detected court name (pulled from the page's <title>) is
 # transliterated to Latin characters for the filename (e.g. "Амвросиевский"
@@ -360,15 +374,30 @@ def decode_response(resp: requests.Response) -> str:
         return resp.content.decode(DEFAULT_ENCODING, errors="replace")
 
 
-def fetch(session: requests.Session, url: str, referer: Optional[str]) -> Optional[str]:
+def fetch(session: requests.Session, url: str, referer: Optional[str],
+          identifier: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Returns (decoded_html_text, sha256_hex, local_archive_path).
+    On any non-success outcome, returns (None, None, None).
+
+    The raw response bytes are archived to original_htmls/<host>/ and
+    SHA-256 hashed BEFORE decoding -- the hash covers exactly what the
+    server sent over the wire, not a re-encoded copy, which is what makes
+    it useful as a chain-of-custody / tamper-evidence check later.
+    """
     headers = {}
     if referer:
         headers["Referer"] = referer
+    city = city_from_url(url)
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             resp = session.get(url, headers=headers, timeout=25)
             if resp.status_code == 200:
-                return decode_response(resp)
+                sha256_hex, local_path = archive_bytes(
+                    resp.content, city=city, identifier=identifier, source_url=url,
+                    ext=".html", content_type="text/html",
+                )
+                return decode_response(resp), sha256_hex, local_path
             elif resp.status_code in (403, 429):
                 wait = (2 ** attempt) + random.uniform(1, 4)
                 print(f"    [!] HTTP {resp.status_code}. Backing off {wait:.1f}s "
@@ -376,14 +405,14 @@ def fetch(session: requests.Session, url: str, referer: Optional[str]) -> Option
                 time.sleep(wait)
             else:
                 print(f"    [!] HTTP {resp.status_code} for {url}")
-                return None
+                return None, None, None
         except requests.RequestException as e:
             wait = (2 ** attempt) + random.uniform(1, 4)
             print(f"    [!] Request error: {e}. Retrying in {wait:.1f}s "
                   f"(attempt {attempt}/{MAX_RETRIES})...")
             time.sleep(wait)
     print(f"    [x] Giving up on {url} after {MAX_RETRIES} attempts.")
-    return None
+    return None, None, None
 
 
 def set_page_param(url: str, page: int) -> str:
@@ -427,11 +456,11 @@ def warm_up_session(session: requests.Session, base_url: str) -> Optional[str]:
     search_form_url = f"{parsed.scheme}://{parsed.netloc}/modules.php?name=sud_delo&srv_num=1"
 
     print(f"[i] Warming up session: visiting {root_url}")
-    fetch(session, root_url, referer=None)
+    fetch(session, root_url, referer=None, identifier="root")
     time.sleep(random.uniform(2.0, 4.0))
 
     print(f"[i] Warming up session: visiting {search_form_url}")
-    fetch(session, search_form_url, referer=root_url)
+    fetch(session, search_form_url, referer=root_url, identifier="search_form")
     time.sleep(random.uniform(2.0, 4.0))
 
     return search_form_url
@@ -645,11 +674,12 @@ def crawl(base_url: str, debug: bool) -> Tuple[List[CaseRecord], str]:
 
     page1_url = set_page_param(base_url, 1)
     print(f"[1] Fetching page 1: {page1_url}")
-    html = fetch(session, page1_url, referer)
+    html, sha256_hex, archive_path = fetch(session, page1_url, referer, identifier="page1")
     request_count += 1
     if html is None:
         print("[x] Failed to fetch page 1 -- aborting.")
         return all_records, "UnknownCourt"
+    print(f"    [archived] {archive_path} (sha256: {sha256_hex[:12]}...)")
 
     court_name = extract_court_name(html)
     print(f"    [i] Detected court name: {court_name}")
@@ -680,11 +710,14 @@ def crawl(base_url: str, debug: bool) -> Tuple[List[CaseRecord], str]:
         polite_sleep(request_count)
         page_url = set_page_param(base_url, page_num)
         print(f"[{page_num}] Fetching page {page_num}: {page_url}")
-        html = fetch(session, page_url, referer)
+        html, sha256_hex, archive_path = fetch(
+            session, page_url, referer, identifier=f"page{page_num}"
+        )
         request_count += 1
         if html is None:
             print(f"    [!] Skipping page {page_num} (fetch failed).")
             continue
+        print(f"    [archived] {archive_path} (sha256: {sha256_hex[:12]}...)")
         records = parse_results_page(html, page_url, page_num)
         print(f"    [+] Parsed {len(records)} case(s) from page {page_num}.")
         all_records.extend(records)

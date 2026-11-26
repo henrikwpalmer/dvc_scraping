@@ -14,10 +14,10 @@ For each distinct Solution value, this produces:
 
 import pandas as pd
 
-SOURCE_FILE = "../output/cases_output_ALL_COURTS_DONETSK.xlsx"
+SOURCE_FILE = "../output/cases_output_ALL_COURTS_luhansk.xlsx"
 SHEET_NAME = "ENGLISH"
-OUTPUT_FILE = "../output/solution_summary_donetsk.xlsx"
-DEDUPED_FILE = "../output/ENGLISH_deduped.xlsx"
+OUTPUT_FILE = "../output/solution_summary_luhansk.xlsx"
+DEDUPED_FILE = "../output/ENGLISH_deduped_luhansk.xlsx"
 
 
 def parse_decision_date(series: pd.Series) -> pd.Series:
